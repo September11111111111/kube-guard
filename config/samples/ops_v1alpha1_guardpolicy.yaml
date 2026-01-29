@@ -1,0 +1,22 @@
+apiVersion: ops.example.com/v1alpha1
+kind: GuardPolicy
+metadata:
+  name: restart-mongodb-deploy
+  namespace: default
+spec:
+  # Prometheus Service in-cluster (controller is running inside cluster now)
+  prometheusURL: "http://kps-kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090"
+
+  # Mongo exporter up metric (match any job containing "mongo")
+  query: 'max(up{job=~".*mongo.*"}) or on() vector(0)'
+  threshold: "==0"
+
+  # Evaluate interval & cooldown
+  evaluateEverySeconds: 30
+  cooldownSeconds: 180
+
+  # What to heal
+  targetRef:
+    namespace: default
+    kind: Deployment
+    name: mongodb-deployment

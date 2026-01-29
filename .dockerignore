@@ -1,0 +1,19 @@
+# Git / editor
+.git
+.gitignore
+.github
+.devcontainer
+
+# Build outputs
+bin/
+tmp/
+dist/
+out/
+*.log
+
+# OS junk
+.DS_Store
+
+# (Optional) tests/data you don't want in image build context
+**/*_test.go
+test/
