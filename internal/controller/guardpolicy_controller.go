@@ -29,6 +29,7 @@ import (
 	opsv1alpha1 "example.com/kube-guard/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -128,6 +129,9 @@ func (r *GuardPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.Patch(ctx, &dep, patch); err != nil {
 		l.Error(err, "failed to patch deployment for restart")
 		return ctrl.Result{RequeueAfter: every}, nil
+	}
+	if err := r.Status().Update(ctx, gp); err != nil {
+    		return ctrl.Result{}, err
 	}
 
 	now := metav1.Now()
@@ -234,3 +238,21 @@ func evalThreshold(expr string, v float64) (bool, error) {
 		return false, fmt.Errorf("unknown op")
 	}
 }
+
+const (
+    ConditionAvailable = "Available"
+    ConditionDegraded  = "Degraded"
+
+    ActionNone    = "None"
+    ActionRestart = "Restart"
+)
+
+func (r *GuardPolicyReconciler) setCondition(gp *v1alpha1.GuardPolicy, cond metav1.Condition) {
+    meta.SetStatusCondition(&gp.Status.Conditions, cond)
+}
+
+func nowTimePtr() *metav1.Time {
+    t := metav1.Now()
+    return &t
+}
+
