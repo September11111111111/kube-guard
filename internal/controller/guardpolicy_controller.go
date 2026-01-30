@@ -41,6 +41,14 @@ import (
 // +kubebuilder:rbac:groups=ops.example.com,resources=guardpolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
 
+const (
+    ConditionAvailable = "Available"
+    ConditionDegraded  = "Degraded"
+
+    ActionNone    = "None"
+    ActionRestart = "Restart"
+)
+
 // GuardPolicyReconciler reconciles a GuardPolicy object
 type GuardPolicyReconciler struct {
 	client.Client
@@ -61,86 +69,215 @@ type GuardPolicyReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.0/pkg/reconcile
 func (r *GuardPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	l := log.FromContext(ctx)
+    l := log.FromContext(ctx)
 
-	var gp opsv1alpha1.GuardPolicy
-	if err := r.Get(ctx, req.NamespacedName, &gp); err != nil {
-		// deleted
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
+    var gp opsv1alpha1.GuardPolicy
+    if err := r.Get(ctx, req.NamespacedName, &gp); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
 
-	every := time.Duration(gp.Spec.EvaluateEverySeconds) * time.Second
-	if every <= 0 {
-		every = 30 * time.Second
-	}
-	cooldown := time.Duration(gp.Spec.CooldownSeconds) * time.Second
-	if cooldown <= 0 {
-		cooldown = 180 * time.Second
-	}
+    // 计算周期参数
+    every := time.Duration(gp.Spec.EvaluateEverySeconds) * time.Second
+    if every <= 0 {
+        every = 30 * time.Second
+    }
+    cooldown := time.Duration(gp.Spec.CooldownSeconds) * time.Second
+    if cooldown <= 0 {
+        cooldown = 180 * time.Second
+    }
 
-	// Query Prometheus
-	val, err := queryPrometheusInstant(ctx, gp.Spec.PrometheusURL, gp.Spec.Query)
-	if err != nil {
-		l.Error(err, "failed to query prometheus")
-		// still requeue
-		return ctrl.Result{RequeueAfter: every}, nil
-	}
-	gp.Status.LastValue = fmt.Sprintf("%g", val)
+    // status patch 基线
+    base := gp.DeepCopy()
 
-	// Evaluate threshold
-	ok, err := evalThreshold(gp.Spec.Threshold, val)
-	if err != nil {
-		l.Error(err, "invalid threshold", "threshold", gp.Spec.Threshold)
-		return ctrl.Result{RequeueAfter: every}, nil
-	}
+    // 小工具：写 condition
+    setCond := func(c metav1.Condition) {
+        meta.SetStatusCondition(&gp.Status.Conditions, c)
+    }
 
-	// Cooldown check
-	if ok && gp.Status.LastActionTime != nil {
-		if time.Since(gp.Status.LastActionTime.Time) < cooldown {
-			// In cooldown; only update status value
-			_ = r.Status().Update(ctx, &gp)
-			return ctrl.Result{RequeueAfter: every}, nil
-		}
-	}
+    // 确保 action 不为空（首次创建时）
+    if gp.Status.LastAction == "" {
+        gp.Status.LastAction = ActionNone
+    }
 
-	// If not triggered, just update status and requeue
-	if !ok {
-		_ = r.Status().Update(ctx, &gp)
-		return ctrl.Result{RequeueAfter: every}, nil
-	}
+    // 1) Query Prometheus
+    val, err := queryPrometheusInstant(ctx, gp.Spec.PrometheusURL, gp.Spec.Query)
+    if err != nil {
+        l.Error(err, "failed to query prometheus")
 
-	// Trigger: restart deployment by patching pod template annotation
-	ns := gp.Spec.TargetRef.Namespace
-	name := gp.Spec.TargetRef.Name
+        setCond(metav1.Condition{
+            Type:               ConditionDegraded,
+            Status:             metav1.ConditionTrue,
+            Reason:             "PrometheusQueryFailed",
+            Message:            err.Error(),
+            ObservedGeneration: gp.GetGeneration(),
+            LastTransitionTime: metav1.Now(),
+        })
+        setCond(metav1.Condition{
+            Type:               ConditionAvailable,
+            Status:             metav1.ConditionFalse,
+            Reason:             "NotReady",
+            Message:            "Prometheus query failed",
+            ObservedGeneration: gp.GetGeneration(),
+            LastTransitionTime: metav1.Now(),
+        })
 
-	var dep appsv1.Deployment
-	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &dep); err != nil {
-		l.Error(err, "target deployment not found", "ns", ns, "name", name)
-		_ = r.Status().Update(ctx, &gp)
-		return ctrl.Result{RequeueAfter: every}, nil
-	}
+        // 把失败状态写回（不要吞错）
+        if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
+            return ctrl.Result{}, err2
+        }
+        return ctrl.Result{RequeueAfter: every}, nil
+    }
 
-	patch := client.MergeFrom(dep.DeepCopy())
-	if dep.Spec.Template.Annotations == nil {
-		dep.Spec.Template.Annotations = map[string]string{}
-	}
-	dep.Spec.Template.Annotations["kubeguard/restartedAt"] = time.Now().Format(time.RFC3339)
+    // query 成功：写 lastValue + 健康条件
+    gp.Status.LastValue = fmt.Sprintf("%g", val)
+    setCond(metav1.Condition{
+        Type:               ConditionDegraded,
+        Status:             metav1.ConditionFalse,
+        Reason:             "OK",
+        Message:            "Query succeeded",
+        ObservedGeneration: gp.GetGeneration(),
+        LastTransitionTime: metav1.Now(),
+    })
+    setCond(metav1.Condition{
+        Type:               ConditionAvailable,
+        Status:             metav1.ConditionTrue,
+        Reason:             "Ready",
+        Message:            "Policy evaluated",
+        ObservedGeneration: gp.GetGeneration(),
+        LastTransitionTime: metav1.Now(),
+    })
 
-	if err := r.Patch(ctx, &dep, patch); err != nil {
-		l.Error(err, "failed to patch deployment for restart")
-		return ctrl.Result{RequeueAfter: every}, nil
-	}
-	if err := r.Status().Update(ctx, gp); err != nil {
-    		return ctrl.Result{}, err
-	}
+    // 2) Evaluate threshold
+    ok, err := evalThreshold(gp.Spec.Threshold, val)
+    if err != nil {
+        l.Error(err, "invalid threshold", "threshold", gp.Spec.Threshold)
 
-	now := metav1.Now()
-	gp.Status.LastActionTime = &now
-	gp.Status.LastAction = fmt.Sprintf("restarted deployment %s/%s", ns, name)
-	_ = r.Status().Update(ctx, &gp)
+        setCond(metav1.Condition{
+            Type:               ConditionDegraded,
+            Status:             metav1.ConditionTrue,
+            Reason:             "InvalidThreshold",
+            Message:            err.Error(),
+            ObservedGeneration: gp.GetGeneration(),
+            LastTransitionTime: metav1.Now(),
+        })
+        setCond(metav1.Condition{
+            Type:               ConditionAvailable,
+            Status:             metav1.ConditionFalse,
+            Reason:             "NotReady",
+            Message:            "Threshold invalid",
+            ObservedGeneration: gp.GetGeneration(),
+            LastTransitionTime: metav1.Now(),
+        })
 
-	l.Info("restart triggered", "policy", req.NamespacedName.String(), "value", val, "threshold", gp.Spec.Threshold, "target", ns+"/"+name)
-	return ctrl.Result{RequeueAfter: every}, nil
+        if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
+            return ctrl.Result{}, err2
+        }
+        return ctrl.Result{RequeueAfter: every}, nil
+    }
+
+    // 3) cooldown check（ok=true 才需要）
+    if ok && gp.Status.LastActionTime != nil && time.Since(gp.Status.LastActionTime.Time) < cooldown {
+        // 冷却期：只更新 lastValue/conditions/action(None) 即可
+        gp.Status.LastAction = ActionNone
+        if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
+            return ctrl.Result{}, err2
+        }
+        l.Info("in cooldown, skip action", "policy", req.NamespacedName.String(), "value", val, "cooldown", cooldown.String())
+        return ctrl.Result{RequeueAfter: every}, nil
+    }
+
+    // 4) 不触发：明确写 None + 写回 status
+    if !ok {
+        gp.Status.LastAction = ActionNone
+        if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
+            return ctrl.Result{}, err2
+        }
+        l.Info("policy evaluated (no action)", "policy", req.NamespacedName.String(), "value", val, "threshold", gp.Spec.Threshold)
+        return ctrl.Result{RequeueAfter: every}, nil
+    }
+
+    // 5) 触发动作：重启 deployment
+    ns := gp.Spec.TargetRef.Namespace
+    name := gp.Spec.TargetRef.Name
+
+    var dep appsv1.Deployment
+    if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &dep); err != nil {
+        l.Error(err, "target deployment not found", "ns", ns, "name", name)
+
+        setCond(metav1.Condition{
+            Type:               ConditionDegraded,
+            Status:             metav1.ConditionTrue,
+            Reason:             "TargetNotFound",
+            Message:            err.Error(),
+            ObservedGeneration: gp.GetGeneration(),
+            LastTransitionTime: metav1.Now(),
+        })
+        setCond(metav1.Condition{
+            Type:               ConditionAvailable,
+            Status:             metav1.ConditionFalse,
+            Reason:             "NotReady",
+            Message:            "Target deployment not found",
+            ObservedGeneration: gp.GetGeneration(),
+            LastTransitionTime: metav1.Now(),
+        })
+
+        gp.Status.LastAction = ActionNone
+        if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
+            return ctrl.Result{}, err2
+        }
+        return ctrl.Result{RequeueAfter: every}, nil
+    }
+
+    patch := client.MergeFrom(dep.DeepCopy())
+    if dep.Spec.Template.Annotations == nil {
+        dep.Spec.Template.Annotations = map[string]string{}
+    }
+    dep.Spec.Template.Annotations["kubeguard/restartedAt"] = time.Now().Format(time.RFC3339)
+
+    if err := r.Patch(ctx, &dep, patch); err != nil {
+        l.Error(err, "failed to patch deployment for restart")
+
+        setCond(metav1.Condition{
+            Type:               ConditionDegraded,
+            Status:             metav1.ConditionTrue,
+            Reason:             "RestartPatchFailed",
+            Message:            err.Error(),
+            ObservedGeneration: gp.GetGeneration(),
+            LastTransitionTime: metav1.Now(),
+        })
+        setCond(metav1.Condition{
+            Type:               ConditionAvailable,
+            Status:             metav1.ConditionFalse,
+            Reason:             "NotReady",
+            Message:            "Failed to restart target",
+            ObservedGeneration: gp.GetGeneration(),
+            LastTransitionTime: metav1.Now(),
+        })
+
+        if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
+            return ctrl.Result{}, err2
+        }
+        return ctrl.Result{RequeueAfter: every}, nil
+    }
+
+    // restart 成功：写 action + time，再写回 status（一次就够）
+    now := metav1.Now()
+    gp.Status.LastActionTime = &now
+    gp.Status.LastAction = ActionRestart
+
+    if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
+        return ctrl.Result{}, err2
+    }
+
+    l.Info("restart triggered",
+        "policy", req.NamespacedName.String(),
+        "value", val,
+        "threshold", gp.Spec.Threshold,
+        "target", ns+"/"+name,
+        "requeueAfter", every.String(),
+    )
+
+    return ctrl.Result{RequeueAfter: every}, nil
 }
 
 func (r *GuardPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -238,14 +375,6 @@ func evalThreshold(expr string, v float64) (bool, error) {
 		return false, fmt.Errorf("unknown op")
 	}
 }
-
-const (
-    ConditionAvailable = "Available"
-    ConditionDegraded  = "Degraded"
-
-    ActionNone    = "None"
-    ActionRestart = "Restart"
-)
 
 func (r *GuardPolicyReconciler) setCondition(gp *v1alpha1.GuardPolicy, cond metav1.Condition) {
     meta.SetStatusCondition(&gp.Status.Conditions, cond)
