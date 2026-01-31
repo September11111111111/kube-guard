@@ -181,7 +181,7 @@ func (r *GuardPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
 			return ctrl.Result{}, err2
 		}
-		l.Info("in cooldown, skip action", "policy", req.NamespacedName.String(), "value", val, "cooldown", cooldown.String())
+		l.Info("in cooldown, skip action", "policy", req.String(), "value", val, "cooldown", cooldown.String())
 		return ctrl.Result{RequeueAfter: every}, nil
 	}
 
@@ -191,7 +191,7 @@ func (r *GuardPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
 			return ctrl.Result{}, err2
 		}
-		l.Info("policy evaluated (no action)", "policy", req.NamespacedName.String(), "value", val, "threshold", gp.Spec.Threshold)
+		l.Info("policy evaluated (no action)", "policy", req.String(), "value", val, "threshold", gp.Spec.Threshold)
 		return ctrl.Result{RequeueAfter: every}, nil
 	}
 
@@ -269,7 +269,7 @@ func (r *GuardPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	l.Info("restart triggered",
-		"policy", req.NamespacedName.String(),
+		"policy", req.String(),
 		"value", val,
 		"threshold", gp.Spec.Threshold,
 		"target", ns+"/"+name,
@@ -318,7 +318,7 @@ func queryPrometheusInstant(ctx context.Context, baseURL, promql string) (float6
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var pr promResp
 	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
@@ -375,11 +375,12 @@ func evalThreshold(expr string, v float64) (bool, error) {
 	}
 }
 
-func (r *GuardPolicyReconciler) setCondition(gp *opsv1alpha1.GuardPolicy, cond metav1.Condition) {
-	meta.SetStatusCondition(&gp.Status.Conditions, cond)
-}
+// unused func
+// func (r *GuardPolicyReconciler) setCondition(gp *opsv1alpha1.GuardPolicy, cond metav1.Condition) {
+// 	meta.SetStatusCondition(&gp.Status.Conditions, cond)
+// }
 
-func nowTimePtr() *metav1.Time {
-	t := metav1.Now()
-	return &t
-}
+// func nowTimePtr() *metav1.Time {
+// 	t := metav1.Now()
+// 	return &t
+//
