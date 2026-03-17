@@ -28,7 +28,6 @@ import (
 
 	opsv1alpha1 "example.com/kube-guard/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -77,22 +76,10 @@ func (r *GuardPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// 计算周期参数
-	every := time.Duration(gp.Spec.EvaluateEverySeconds) * time.Second
-	if every <= 0 {
-		every = 30 * time.Second
-	}
-	cooldown := time.Duration(gp.Spec.CooldownSeconds) * time.Second
-	if cooldown <= 0 {
-		cooldown = 180 * time.Second
-	}
+	every, cooldown := resolveIntervals(gp)
 
 	// status patch 基线
 	base := gp.DeepCopy()
-
-	// 小工具：写 condition
-	setCond := func(c metav1.Condition) {
-		meta.SetStatusCondition(&gp.Status.Conditions, c)
-	}
 
 	// 确保 action 不为空（首次创建时）
 	if gp.Status.LastAction == "" {
@@ -104,22 +91,7 @@ func (r *GuardPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err != nil {
 		l.Error(err, "failed to query prometheus")
 
-		setCond(metav1.Condition{
-			Type:               ConditionDegraded,
-			Status:             metav1.ConditionTrue,
-			Reason:             "PrometheusQueryFailed",
-			Message:            err.Error(),
-			ObservedGeneration: gp.GetGeneration(),
-			LastTransitionTime: metav1.Now(),
-		})
-		setCond(metav1.Condition{
-			Type:               ConditionAvailable,
-			Status:             metav1.ConditionFalse,
-			Reason:             "NotReady",
-			Message:            "Prometheus query failed",
-			ObservedGeneration: gp.GetGeneration(),
-			LastTransitionTime: metav1.Now(),
-		})
+		setQueryFailedConditions(&gp.Status, gp.GetGeneration(), err.Error())
 
 		// 把失败状态写回（不要吞错）
 		if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
@@ -130,43 +102,13 @@ func (r *GuardPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// query 成功：写 lastValue + 健康条件
 	gp.Status.LastValue = fmt.Sprintf("%g", val)
-	setCond(metav1.Condition{
-		Type:               "Degraded",
-		Status:             metav1.ConditionFalse,
-		Reason:             "OK",
-		Message:            "Prometheus query succeeded",
-		ObservedGeneration: gp.GetGeneration(),
-		LastTransitionTime: metav1.Now(),
-	})
-	setCond(metav1.Condition{
-		Type:               "Available",
-		Status:             metav1.ConditionTrue,
-		Reason:             "Ready",
-		Message:            "Policy evaluated",
-		ObservedGeneration: gp.GetGeneration(),
-		LastTransitionTime: metav1.Now(),
-	})
+	setReadyConditions(&gp.Status, gp.GetGeneration())
 
 	ok, err := evalThreshold(gp.Spec.Threshold, val)
 	if err != nil {
 		l.Error(err, "invalid threshold", "threshold", gp.Spec.Threshold)
 
-		setCond(metav1.Condition{
-			Type:               "Degraded",
-			Status:             metav1.ConditionTrue,
-			Reason:             "PrometheusQueryFailed",
-			Message:            err.Error(),
-			ObservedGeneration: gp.GetGeneration(),
-			LastTransitionTime: metav1.Now(),
-		})
-		setCond(metav1.Condition{
-			Type:               "Available",
-			Status:             metav1.ConditionFalse,
-			Reason:             "NotReady",
-			Message:            "Prometheus query failed",
-			ObservedGeneration: gp.GetGeneration(),
-			LastTransitionTime: metav1.Now(),
-		})
+		setQueryFailedConditions(&gp.Status, gp.GetGeneration(), err.Error())
 
 		if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
 			return ctrl.Result{}, err2
@@ -175,7 +117,7 @@ func (r *GuardPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	//  cooldown check（ok=true 才需要）
-	if ok && gp.Status.LastActionTime != nil && time.Since(gp.Status.LastActionTime.Time) < cooldown {
+	if ok && inCooldown(gp.Status.LastActionTime, cooldown, time.Now()) {
 		// 只更新 lastValue/conditions/action(None) 即可
 		gp.Status.LastAction = ActionNone
 		if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
@@ -203,22 +145,7 @@ func (r *GuardPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &dep); err != nil {
 		l.Error(err, "target deployment not found", "ns", ns, "name", name)
 
-		setCond(metav1.Condition{
-			Type:               ConditionDegraded,
-			Status:             metav1.ConditionTrue,
-			Reason:             "TargetNotFound",
-			Message:            err.Error(),
-			ObservedGeneration: gp.GetGeneration(),
-			LastTransitionTime: metav1.Now(),
-		})
-		setCond(metav1.Condition{
-			Type:               ConditionAvailable,
-			Status:             metav1.ConditionFalse,
-			Reason:             "NotReady",
-			Message:            "Target deployment not found",
-			ObservedGeneration: gp.GetGeneration(),
-			LastTransitionTime: metav1.Now(),
-		})
+		setTargetNotFoundConditions(&gp.Status, gp.GetGeneration(), err.Error())
 
 		gp.Status.LastAction = ActionNone
 		if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
@@ -236,22 +163,7 @@ func (r *GuardPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.Patch(ctx, &dep, patch); err != nil {
 		l.Error(err, "failed to patch deployment for restart")
 
-		setCond(metav1.Condition{
-			Type:               ConditionDegraded,
-			Status:             metav1.ConditionTrue,
-			Reason:             "RestartPatchFailed",
-			Message:            err.Error(),
-			ObservedGeneration: gp.GetGeneration(),
-			LastTransitionTime: metav1.Now(),
-		})
-		setCond(metav1.Condition{
-			Type:               ConditionAvailable,
-			Status:             metav1.ConditionFalse,
-			Reason:             "NotReady",
-			Message:            "Failed to restart target",
-			ObservedGeneration: gp.GetGeneration(),
-			LastTransitionTime: metav1.Now(),
-		})
+		setRestartPatchFailedConditions(&gp.Status, gp.GetGeneration(), err.Error())
 
 		if err2 := r.Status().Patch(ctx, &gp, client.MergeFrom(base)); err2 != nil {
 			return ctrl.Result{}, err2

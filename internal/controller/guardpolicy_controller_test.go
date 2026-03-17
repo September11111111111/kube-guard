@@ -1,19 +1,3 @@
-/*
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
@@ -31,54 +15,84 @@ import (
 )
 
 var _ = Describe("GuardPolicy Controller", func() {
-	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+	const (
+		resourceName = "test-resource"
+		namespace    = "default"
+	)
 
-		ctx := context.Background()
+	ctx := context.Background()
+	typeNamespacedName := types.NamespacedName{
+		Name:      resourceName,
+		Namespace: namespace,
+	}
 
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+	newGuardPolicy := func() *opsv1alpha1.GuardPolicy {
+		return &opsv1alpha1.GuardPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      resourceName,
+				Namespace: namespace,
+			},
+			Spec: opsv1alpha1.GuardPolicySpec{
+				// TODO: 填入你的最小有效 spec
+			},
 		}
-		guardpolicy := &opsv1alpha1.GuardPolicy{}
+	}
 
-		BeforeEach(func() {
-			By("creating the custom resource for the Kind GuardPolicy")
-			err := k8sClient.Get(ctx, typeNamespacedName, guardpolicy)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &opsv1alpha1.GuardPolicy{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
-					},
-					// TODO(user): Specify other spec details if needed.
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-			}
-		})
-
-		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &opsv1alpha1.GuardPolicy{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
+	BeforeEach(func() {
+		resource := &opsv1alpha1.GuardPolicy{}
+		err := k8sClient.Get(ctx, typeNamespacedName, resource)
+		if err != nil && errors.IsNotFound(err) {
+			Expect(k8sClient.Create(ctx, newGuardPolicy())).To(Succeed())
+		} else {
 			Expect(err).NotTo(HaveOccurred())
+		}
+	})
 
-			By("Cleanup the specific resource instance GuardPolicy")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &GuardPolicyReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
+	AfterEach(func() {
+		resource := &opsv1alpha1.GuardPolicy{}
+		err := k8sClient.Get(ctx, typeNamespacedName, resource)
+		if err != nil {
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+			return
+		}
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+	It("should reconcile an existing GuardPolicy without error", func() {
+		controllerReconciler := &GuardPolicyReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: typeNamespacedName,
 		})
+
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.Requeue || result.RequeueAfter >= 0).To(BeTrue())
+
+		got := &opsv1alpha1.GuardPolicy{}
+		Expect(k8sClient.Get(ctx, typeNamespacedName, got)).To(Succeed())
+
+		// TODO: 根据你的控制器逻辑补充这些断言
+		// Expect(got.Status.ObservedGeneration).To(Equal(got.Generation))
+		// Expect(got.Status.LastCheckTime.IsZero()).To(BeFalse())
+	})
+
+	It("should ignore a missing GuardPolicy", func() {
+		controllerReconciler := &GuardPolicyReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		req := reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      "not-found",
+				Namespace: namespace,
+			},
+		}
+
+		_, err := controllerReconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
 	})
 })
