@@ -1,0 +1,15 @@
+apiVersion: ops.example.com/v1alpha1
+kind: GuardPolicy
+metadata:
+  name: demo-restart-policy
+  namespace: default
+spec:
+  prometheusURL: "http://localhost:8081"
+  query: "up"
+  threshold: "== 0"
+  evaluateEverySeconds: 5
+  cooldownSeconds: 60
+  targetRef:
+    kind: Deployment
+    name: demo-app
+    namespace: default

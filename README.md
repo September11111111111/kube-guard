@@ -133,3 +133,25 @@ spec:
     namespace: default
     kind: Deployment
     name: my-app
+```
+
+---
+
+## 最小恢复实验
+
+在本地 kind 集群上，使用测试 Deployment 与 mock Prometheus 指标源进行了最小闭环验证。
+
+实验配置：
+
+- `evaluateEverySeconds: 5`
+- `cooldownSeconds: 60`
+- `threshold: == 0`
+- target: `Deployment/demo-app`
+
+实验中，mock 指标在启动 20 秒后由正常值 `1` 切换为异常值 `0`。控制器在检测到阈值命中后，成功触发目标 Deployment 的滚动重启，并在冷却窗口内跳过重复动作。
+
+一次实验测得：
+
+- 检测延迟：约 **1.0s**
+- 动作落地耗时：**小于 1s**
+- 端到端自动恢复触发耗时：约 **1.0s**
